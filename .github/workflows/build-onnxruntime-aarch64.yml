@@ -192,12 +192,16 @@ jobs:
       # ──────────────────────────────────────────────────────────────
       - name: Verify output binary architecture
         run: |
-          LIB=$(find "${{ env.INSTALL_PREFIX }}" -name "libonnxruntime.so*" | head -n1)
+          # 查找带版本号的实际 .so 文件（跳过符号链接）
+          LIB=$(find "${{ env.INSTALL_PREFIX }}" -name "libonnxruntime.so.*" -not -type l | head -n1)
           if [ -z "$LIB" ]; then
-            echo "ERROR: libonnxruntime.so not found!" && exit 1
+            echo "ERROR: libonnxruntime.so.* not found!" && exit 1
           fi
           echo "Library: $LIB"
+          echo "=== file output ==="
           file "$LIB"
+          echo "=== aarch64-linux-gnu-readelf output ==="
+          aarch64-linux-gnu-readelf -h "$LIB" | grep -E "Class:|Machine:"
           # 确认是 AArch64
           file "$LIB" | grep -q "ARM aarch64" \
             && echo "✅ Architecture check passed: AArch64" \
