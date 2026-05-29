@@ -1,0 +1,239 @@
+name: Cross-Compile ONNXRuntime 1.15 for AArch64
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  ONNX_VERSION: "v1.15.1"
+  # Linaro 工具链版本标识（与压缩包文件名保持一致）
+  TOOLCHAIN_NAME: "gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu"
+  TOOLCHAIN_URL: "https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz"
+  TOOLCHAIN_ROOT: "/opt/linaro"
+  INSTALL_PREFIX: "${{ github.workspace }}/onnxruntime-aarch64-install"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ──────────────────────────────────────────────────────────────
+      # 1. 检出代码（如果本仓库包含自己的 CMake 工具链文件则会一起带入）
+      # ──────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────────────
+      # 2. 安装系统依赖
+      # ──────────────────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            git \
+            wget \
+            xz-utils \
+            python3 \
+            python3-pip \
+            python3-numpy \
+            libssl-dev \
+            ca-certificates
+
+      # ──────────────────────────────────────────────────────────────
+      # 3. 缓存 Linaro 工具链（避免每次重复下载 ~700 MB）
+      # ──────────────────────────────────────────────────────────────
+      - name: Cache Linaro toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TOOLCHAIN_ROOT }}/${{ env.TOOLCHAIN_NAME }}
+          key: linaro-toolchain-${{ env.TOOLCHAIN_NAME }}
+
+      - name: Download and extract Linaro toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "${{ env.TOOLCHAIN_ROOT }}"
+          echo "Downloading Linaro GCC 7.5.0 toolchain..."
+          wget --progress=dot:giga -O /tmp/linaro-toolchain.tar.xz "${{ env.TOOLCHAIN_URL }}"
+          echo "Extracting toolchain..."
+          tar -xJf /tmp/linaro-toolchain.tar.xz -C "${{ env.TOOLCHAIN_ROOT }}"
+          rm -f /tmp/linaro-toolchain.tar.xz
+          echo "Toolchain installed at: ${{ env.TOOLCHAIN_ROOT }}/${{ env.TOOLCHAIN_NAME }}"
+
+      - name: Add toolchain to PATH
+        run: |
+          TOOLCHAIN_BIN="${{ env.TOOLCHAIN_ROOT }}/${{ env.TOOLCHAIN_NAME }}/bin"
+          echo "$TOOLCHAIN_BIN" >> "$GITHUB_PATH"
+          # 立即生效（同一步内验证）
+          export PATH="$TOOLCHAIN_BIN:$PATH"
+          echo "=== Toolchain version ==="
+          aarch64-linux-gnu-gcc --version
+
+      # ──────────────────────────────────────────────────────────────
+      # 4. 缓存 ONNX Runtime 源码（减少 git clone 时间）
+      # ──────────────────────────────────────────────────────────────
+      - name: Cache ONNX Runtime source
+        id: cache-onnx-src
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/onnxruntime
+          key: onnxruntime-src-${{ env.ONNX_VERSION }}
+
+      - name: Clone ONNX Runtime ${{ env.ONNX_VERSION }}
+        if: steps.cache-onnx-src.outputs.cache-hit != 'true'
+        run: |
+          git clone \
+            --depth 1 \
+            --branch "${{ env.ONNX_VERSION }}" \
+            --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/microsoft/onnxruntime.git \
+            "${{ github.workspace }}/onnxruntime"
+
+      # ──────────────────────────────────────────────────────────────
+      # 5. 写入 CMake 工具链文件
+      #    路径：$GITHUB_WORKSPACE/aarch64-toolchain.cmake
+      # ──────────────────────────────────────────────────────────────
+      - name: Generate CMake toolchain file
+        run: |
+          TOOLCHAIN_BIN="${{ env.TOOLCHAIN_ROOT }}/${{ env.TOOLCHAIN_NAME }}/bin"
+          TOOLCHAIN_SYSROOT="${{ env.TOOLCHAIN_ROOT }}/${{ env.TOOLCHAIN_NAME }}/aarch64-linux-gnu/libc"
+
+          cat > "${{ github.workspace }}/aarch64-toolchain.cmake" <<EOF
+          # -------------------------------------------------------
+          # CMake Toolchain File
+          # Target : AArch64 Linux (aarch64-linux-gnu)
+          # Toolchain: Linaro GCC 7.5.0-2019.12
+          # -------------------------------------------------------
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+          set(TOOLCHAIN_BIN "${TOOLCHAIN_BIN}")
+
+          set(CMAKE_C_COMPILER   "${TOOLCHAIN_BIN}/aarch64-linux-gnu-gcc")
+          set(CMAKE_CXX_COMPILER "${TOOLCHAIN_BIN}/aarch64-linux-gnu-g++")
+          set(CMAKE_AR           "${TOOLCHAIN_BIN}/aarch64-linux-gnu-ar"  CACHE FILEPATH "Archiver")
+          set(CMAKE_RANLIB       "${TOOLCHAIN_BIN}/aarch64-linux-gnu-ranlib" CACHE FILEPATH "Ranlib")
+          set(CMAKE_STRIP        "${TOOLCHAIN_BIN}/aarch64-linux-gnu-strip" CACHE FILEPATH "Strip")
+
+          # sysroot（Linaro 自带的最小 glibc sysroot）
+          set(CMAKE_SYSROOT "${TOOLCHAIN_SYSROOT}")
+          set(CMAKE_FIND_ROOT_PATH "${TOOLCHAIN_SYSROOT}")
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+
+          # 目标架构编译标志
+          set(CMAKE_C_FLAGS_INIT   "-march=armv8-a")
+          set(CMAKE_CXX_FLAGS_INIT "-march=armv8-a")
+          EOF
+
+          echo "=== Toolchain file content ==="
+          cat "${{ github.workspace }}/aarch64-toolchain.cmake"
+
+      # ──────────────────────────────────────────────────────────────
+      # 6. CMake 配置
+      # ──────────────────────────────────────────────────────────────
+      - name: Configure ONNX Runtime (CMake)
+        run: |
+          cmake \
+            -S "${{ github.workspace }}/onnxruntime/cmake" \
+            -B "${{ github.workspace }}/build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/aarch64-toolchain.cmake" \
+            -DCMAKE_INSTALL_PREFIX="${{ env.INSTALL_PREFIX }}" \
+            \
+            -Donnxruntime_BUILD_SHARED_LIB=ON \
+            -Donnxruntime_BUILD_UNIT_TESTS=OFF \
+            -Donnxruntime_BUILD_BENCHMARKS=OFF \
+            -Donnxruntime_USE_OPENMP=OFF \
+            -Donnxruntime_USE_CUDA=OFF \
+            -Donnxruntime_USE_TENSORRT=OFF \
+            -Donnxruntime_USE_NNAPI_BUILTIN=OFF \
+            -Donnxruntime_USE_XNNPACK=OFF \
+            -Donnxruntime_USE_NCCL=OFF \
+            -Donnxruntime_ENABLE_PYTHON=OFF \
+            -Donnxruntime_ENABLE_TRAINING=OFF \
+            -Donnxruntime_ENABLE_TRAINING_OPS=OFF \
+            -Donnxruntime_CROSS_COMPILING=ON \
+            \
+            -DPYTHON_EXECUTABLE="$(which python3)" \
+            -DONNX_CUSTOM_PROTOC_EXECUTABLE="$(which protoc 2>/dev/null || echo '')"
+
+      # ──────────────────────────────────────────────────────────────
+      # 7. 编译
+      # ──────────────────────────────────────────────────────────────
+      - name: Build ONNX Runtime
+        run: |
+          cmake --build "${{ github.workspace }}/build" \
+            --config Release \
+            --parallel "$(nproc)"
+
+      # ──────────────────────────────────────────────────────────────
+      # 8. 安装（收集头文件 + .so）
+      # ──────────────────────────────────────────────────────────────
+      - name: Install ONNX Runtime
+        run: |
+          cmake --install "${{ github.workspace }}/build" --config Release
+          echo "=== Installed files ==="
+          find "${{ env.INSTALL_PREFIX }}" -type f | sort
+
+      # ──────────────────────────────────────────────────────────────
+      # 9. 验证产物架构
+      # ──────────────────────────────────────────────────────────────
+      - name: Verify output binary architecture
+        run: |
+          LIB=$(find "${{ env.INSTALL_PREFIX }}" -name "libonnxruntime.so*" | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "ERROR: libonnxruntime.so not found!" && exit 1
+          fi
+          echo "Library: $LIB"
+          file "$LIB"
+          # 确认是 AArch64
+          file "$LIB" | grep -q "ARM aarch64" \
+            && echo "✅ Architecture check passed: AArch64" \
+            || (echo "❌ Architecture mismatch!" && exit 1)
+
+      # ──────────────────────────────────────────────────────────────
+      # 10. 打包产物
+      # ──────────────────────────────────────────────────────────────
+      - name: Package artifacts
+        run: |
+          cd "${{ github.workspace }}"
+          TARBALL="onnxruntime-${{ env.ONNX_VERSION }}-aarch64-linux-gnu.tar.gz"
+          tar -czf "$TARBALL" \
+            -C "$(dirname "${{ env.INSTALL_PREFIX }}")" \
+            "$(basename "${{ env.INSTALL_PREFIX }}")"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          ls -lh "$TARBALL"
+
+      # ──────────────────────────────────────────────────────────────
+      # 11. 上传 Artifact（保留 7 天）
+      # ──────────────────────────────────────────────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-${{ env.ONNX_VERSION }}-aarch64-linux-gnu
+          path: ${{ github.workspace }}/${{ env.TARBALL }}
+          retention-days: 7
+
+      # ──────────────────────────────────────────────────────────────
+      # 12. 打 Tag 时自动发布 Release
+      # ──────────────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/${{ env.TARBALL }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
